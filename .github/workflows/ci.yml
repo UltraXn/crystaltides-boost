@@ -1,0 +1,185 @@
+name: CI | CrystalTides Boost Mod
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-boost-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_TOOLCHAINS: -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64 -Porg.gradle.java.installations.auto-download=false
+
+jobs:
+  versions:
+    name: Version groups
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.read.outputs.list }}
+      fabric-tasks: ${{ steps.read.outputs.fabric-tasks }}
+      runtime: ${{ steps.read.outputs.runtime }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read the version groups
+        id: read
+        run: |
+          versions=$(grep -oP '^\s*match\("\K[^"]+' settings.gradle.kts)
+          test -n "$versions"
+          echo "list=$(printf '%s\n' $versions | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "fabric-tasks=$(printf ':%s-fabric:build ' $versions)" >> "$GITHUB_OUTPUT"
+          python3 - "$versions" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys, tomllib
+          with open("stonecutter.properties.toml", "rb") as handle:
+              props = tomllib.load(handle)
+          runs = []
+          for group in sys.argv[1].split():
+              java = 25 if int(group.split(".")[0]) >= 26 else 21
+              for mc in props[group]["mod"]["mc_releases"]:
+                  for loader in ("fabric", "neoforge"):
+                      runs.append({"mc": mc, "group": group, "loader": loader, "java": java})
+          print("runtime=" + json.dumps(runs))
+          EOF
+
+  fabric:
+    name: Fabric (all versions) + tests
+    needs: versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 + 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Build & Test
+        run: ./gradlew ${{ needs.versions.outputs.fabric-tasks }} --console=plain $GRADLE_TOOLCHAINS
+
+      - name: Check the mixin remapping (1.21.x)
+        run: python3 -I tools/check_remap.py $(ls versions/1.21*-fabric/build/libs/*.jar | grep -v -- -sources)
+
+      - name: Upload the Fabric jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: crystaltides-boost-fabric
+          path: |
+            versions/*-fabric/build/libs/crystaltides-boost-fabric-*.jar
+            !versions/*/build/libs/*-sources.jar
+          if-no-files-found: error
+
+  neoforge:
+    name: NeoForge ${{ matrix.version }}
+    needs: versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.versions.outputs.list) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 + 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Build
+        run: ./gradlew :${{ matrix.version }}-neoforge:build --console=plain -Dorg.gradle.jvmargs=-Xmx2g $GRADLE_TOOLCHAINS
+
+      - name: Upload the NeoForge jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: crystaltides-boost-neoforge-${{ matrix.version }}
+          path: |
+            versions/${{ matrix.version }}-neoforge/build/libs/crystaltides-boost-neoforge-*.jar
+            !versions/*/build/libs/*-sources.jar
+          if-no-files-found: error
+
+  runtime:
+    name: Runtime ${{ matrix.loader }} ${{ matrix.mc }}
+    needs: [versions, fabric, neoforge]
+    if: ${{ !cancelled() && needs.versions.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.versions.outputs.runtime) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      - name: Download the mod jar
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.loader == 'fabric' && 'crystaltides-boost-fabric' || format('crystaltides-boost-neoforge-{0}', matrix.group) }}
+          path: artifact
+
+      - name: Stage the mod and the test mod
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p run/mods
+          jar=$(find artifact -name "crystaltides-boost-${{ matrix.loader }}-${{ matrix.group }}-*.jar" ! -name "*-sources.jar" | head -1)
+          test -n "$jar"
+          cp "$jar" run/mods/
+          for tm in "${{ matrix.mc }}" "${{ matrix.group }}"; do
+            gh release download "$tm-latest" --repo headlesshq/mc-runtime-test-mod \
+              --pattern "mc-runtime-test-$tm-${{ matrix.loader }}-*.jar" --dir run/mods && break
+          done
+          ls -l run/mods
+          test "$(ls run/mods | grep -c '^mc-runtime-test-')" -eq 1
+
+      - name: Run Minecraft ${{ matrix.mc }} (${{ matrix.loader }})
+        uses: headlesshq/mc-runtime-test@5.0.0
+        with:
+          mc: ${{ matrix.mc }}
+          modloader: ${{ matrix.loader }}
+          mc-runtime-test: none
+          java: ${{ matrix.java }}
+          cache-mc: "false"
+
+      - name: Check the game log
+        run: python3 -I tools/check_runtime_log.py run/logs/latest.log --group ${{ matrix.group }}
+
+      - name: Upload the game log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-log-${{ matrix.loader }}-${{ matrix.mc }}
+          path: |
+            run/logs/latest.log
+            run/crash-reports/
+          if-no-files-found: ignore
