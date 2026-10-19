@@ -4,6 +4,9 @@ import com.crystaltides.boost.config.BoostConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.management.ManagementFactory;
+import java.util.List;
+
 /**
  * Sizes Minecraft's background worker pool ("Worker-Main-*", Util#backgroundExecutor), which generates
  * terrain for the integrated server and builds chunk meshes for the client.
@@ -29,8 +32,14 @@ public final class BackgroundWorkers {
 
     /** Called once, while Util initializes its executors. */
     public static int maxThreads(int vanillaMax) {
-        if (System.getProperty(MAX_THREADS_PROPERTY) != null) {
-            return vanillaMax; // an explicit -Dmax.bg.threads always wins
+        String runtimeValue = System.getProperty(MAX_THREADS_PROPERTY);
+        if (runtimeValue != null) {
+            if (isOnCommandLine(ManagementFactory.getRuntimeMXBean().getInputArguments())) {
+                return vanillaMax; // an explicit -Dmax.bg.threads always wins
+            }
+            // Another mod set it while loading (ModernFix does), which is not a user choice: the Boost cap
+            // still applies on top of it
+            LOGGER.info("[Workers] max.bg.threads={} was set by another mod, not the command line", runtimeValue);
         }
         int logicalCpus = Runtime.getRuntime().availableProcessors();
         int physicalCores = Integer.getInteger(PHYSICAL_CORES_PROPERTY, 0);
@@ -42,6 +51,12 @@ public final class BackgroundWorkers {
         LOGGER.info("[Workers] background pool: {} workers (vanilla: {}; {} logical CPUs, physical cores: {})",
             Math.min(vanillaPool, cap), vanillaPool, logicalCpus, physicalCores > 0 ? physicalCores : "unknown");
         return Math.min(vanillaMax, cap);
+    }
+
+    /** True when the JVM arguments set max.bg.threads, as opposed to a mod calling System.setProperty. */
+    public static boolean isOnCommandLine(List<String> jvmArguments) {
+        String flag = "-D" + MAX_THREADS_PROPERTY;
+        return jvmArguments.stream().anyMatch(arg -> arg.equals(flag) || arg.startsWith(flag + "="));
     }
 
     /** Effective cap for a backgroundWorkerLimit setting; 0 or less means vanilla. */

@@ -5,8 +5,11 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.StringReader;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BackgroundWorkersTest {
 
@@ -53,6 +56,16 @@ class BackgroundWorkersTest {
         assertEquals(BoostConfig.BACKGROUND_WORKERS_AUTO, parse("backgroundWorkerLimit=many").getBackgroundWorkerLimit());
         assertEquals(BoostConfig.MAX_BACKGROUND_WORKERS, parse("backgroundWorkerLimit=9999").getBackgroundWorkerLimit());
         assertEquals(BoostConfig.BACKGROUND_WORKERS_AUTO, parse("").getBackgroundWorkerLimit(), "sin la clave: el defecto");
+    }
+
+    @Test
+    @DisplayName("Solo un -Dmax.bg.threads de la línea de comandos cuenta como explícito; el que fija otro mod en runtime no")
+    void testIsOnCommandLine() {
+        assertTrue(BackgroundWorkers.isOnCommandLine(List.of("-Xmx8G", "-Dmax.bg.threads=8")));
+        assertTrue(BackgroundWorkers.isOnCommandLine(List.of("-Dmax.bg.threads")));
+        assertFalse(BackgroundWorkers.isOnCommandLine(List.of()), "ModernFix lo fija con System.setProperty");
+        assertFalse(BackgroundWorkers.isOnCommandLine(List.of("-Dcrystaltides.boost.physicalCores=12")));
+        assertFalse(BackgroundWorkers.isOnCommandLine(List.of("-Dmax.bg.threadsX=8")), "otra propiedad");
     }
 
     private static BoostConfig parse(String text) {
